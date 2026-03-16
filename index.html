@@ -1,4 +1,4 @@
-<!doctype html>
+  <!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
@@ -316,7 +316,7 @@
       line-height: 1.4;
     }
 
-    #IList {
+    #robotList {
       max-height: 170px;
       overflow-y: auto;
       margin-top: 4px;
@@ -347,19 +347,37 @@
       margin-bottom: 4px;
       display: flex;
       justify-content: space-between;
+      align-items: center;
       gap: 8px;
     }
 
     #robotList div span.id {
       font-weight: 600;
       color: var(--accent-strong);
+      min-width: 40px;
     }
 
     #robotList div span.meta {
       flex: 1;
-      text-align: right;
       font-size: 10px;
       color: var(--text-muted);
+    }
+
+    #robotList div button {
+      padding: 2px 6px;
+      font-size: 10px;
+      margin: 0;
+    }
+
+    .row {
+      display: flex;
+      gap: 6px;
+      margin-top: 4px;
+    }
+
+    .row input,
+    .row select {
+      flex: 1;
     }
 
   </style>
@@ -398,7 +416,7 @@
         <!-- Robots list -->
         <div class="panel">
           <div class="panel-header">
-            <h4>Robots</h4>
+            <h4>Active Robots</h4>
             <span class="tag">Live State</span>
           </div>
           <div id="robotList">No robots yet</div>
@@ -426,53 +444,54 @@
         <div class="panel">
           <div class="panel-header">
             <h4>Spawn Robot</h4>
-            <span class="tag">Robots</span>
+            <span class="tag">Interactive</span>
           </div>
-          <label>Source
+          <div class="row">
             <select id="sourceSelect"></select>
-          </label>
-          <label>Destination
             <select id="destSelect"></select>
-          </label>
-          <label>Robot ID (optional)
+          </div>
+          <label>Robot ID (auto-generated if empty)
             <input id="robotId" class="robotId" placeholder="e.g. R-10" />
           </label>
           <label>Max speed (m/s)
             <input id="vmax" type="number" value="0.8" step="0.1" />
           </label>
+          <label>Priority (higher = goes first, lower priority yields)
+            <input id="priority" type="number" value="0" step="1" />
+          </label>
           <div class="env-actions">
-            <button id="spawnBtn">Spawn Robot</button>
+            <button id="spawnBtn">✓ Spawn Robot</button>
           </div>
         </div>
 
         <!-- Obstacles -->
         <div class="panel">
           <div class="panel-header">
-            <h4>Obstacles</h4>
-            <span class="tag">Static</span>
+            <h4>Static Obstacles</h4>
+            <span class="tag">Editor</span>
           </div>
           <label>Half side length of square (m)
             <input id="obsRadius" type="number" value="0.4" step="0.05"/>
           </label>
           <div class="env-actions">
-            <button id="clearObstacles" class="secondary">Clear All Obstacles</button>
+            <button id="clearObstacles" class="secondary">Clear All</button>
           </div>
         </div>
 
         <!-- Connection -->
         <div class="panel">
           <div class="panel-header">
-            <h4>Connection</h4>
-            <span class="tag">Backend</span>
+            <h4>Server Connection</h4>
+            <span class="tag">Config</span>
           </div>
-          <label>Server HTTP base
+          <label>HTTP Base
             <input id="serverHttp" type="text" value="http://localhost:8000" />
           </label>
-          <label>Server WS base
+          <label>WebSocket Base
             <input id="serverWs" type="text" value="ws://localhost:8000" />
           </label>
           <div class="env-actions">
-            <button id="applyServer">Reconnect &amp; Sync</button>
+            <button id="applyServer">Reconnect</button>
           </div>
           <div id="info"></div>
         </div>
@@ -605,13 +624,39 @@ function updateRobotList(){
 
     const metaSpan = document.createElement('span');
     metaSpan.className = 'meta';
-    const pos  = (r.position||[]).map(x=>x.toFixed(2)).join(',');
-    const dest = (r.dest||[]).map(x=>x.toFixed(2)).join(',');
-    metaSpan.textContent = `pos: ${pos} | dest: ${dest} | active: ${r.active}`;
+    const pos  = (r.position||[]).map(x=>x.toFixed(1)).join(',');
+    const destStr = r.dest_id ? r.dest_id : (r.dest||[]).map(x=>x.toFixed(1)).join(',');
+    const priority = r.priority || 0;
+    metaSpan.textContent = `[${pos}] → ${destStr} | pri=${priority} | ${r.active?'live':'inactive'}`;
+
+    const removeBtn = document.createElement('button');
+    removeBtn.textContent = '✕';
+    removeBtn.classList.add('secondary');
+    removeBtn.addEventListener('click', () => removeRobot(k));
 
     row.appendChild(idSpan);
     row.appendChild(metaSpan);
+    row.appendChild(removeBtn);
     rdiv.appendChild(row);
+  }
+}
+
+async function removeRobot(robot_id){
+  if(!confirm(`Remove robot ${robot_id}?`)) return;
+  try {
+    const r = await fetch(`${SERVER_HTTP}/remove_robot`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({robot_id: robot_id})
+    });
+    if(r.ok){
+      rememberSelections();
+      await fetchEnv();
+    } else {
+      alert('Failed to remove robot');
+    }
+  } catch(e){
+    console.error('remove error', e);
   }
 }
 
@@ -645,7 +690,7 @@ function populateSelects(tryRestore=false){
     const opt = document.createElement('option');
     opt.value = JSON.stringify({id:d.id, x:d.x, y:d.y, taken:!!d.taken});
     opt.text  = d.id + ` (${d.x.toFixed(1)},${d.y.toFixed(1)})` + (d.taken ? ' (taken)' : '');
-    if(d.taken) opt.classList.add('taken');
+    if(d.taken) opt.disabled = true;
     dstSel.appendChild(opt);
   });
 
@@ -655,10 +700,12 @@ function populateSelects(tryRestore=false){
     srcSel.selectedIndex = 0;
   }
 
-  if(prevDst && Array.from(dstSel.options).some(o => o.value === prevDst)){
+  if(prevDst && Array.from(dstSel.options).some(o => o.value === prevDst && !o.disabled)){
     dstSel.value = prevDst;
-  } else if(dstSel.options.length > 0){
-    dstSel.selectedIndex = 0;
+  } else {
+    // find first non-taken destination
+    const firstFree = Array.from(dstSel.options).find(o => !o.disabled);
+    if(firstFree) dstSel.value = firstFree.value;
   }
 
   const anyFree = (world.destinations || []).some(d => !d.taken);
@@ -692,6 +739,7 @@ document.getElementById('refreshEnv').addEventListener('click', async ()=>{
 });
 
 document.getElementById('resetEnv').addEventListener('click', async ()=>{
+  if(!confirm('Reset entire environment to initial state?')) return;
   try {
     const r = await fetch(`${SERVER_HTTP}/env/reset`, { method:'POST' });
     if(!r.ok){
@@ -719,10 +767,23 @@ document.getElementById('spawnBtn').addEventListener('click', async ()=>{
 
   const src_id = srcObj.id;
   const dest_id = dstObj.id;
-  const rid   = document.getElementById('robotId').value || undefined;
+  const rid   = document.getElementById('robotId').value.trim() || undefined;
   const vmax  = parseFloat(document.getElementById('vmax').value) || 0.8;
+  const priority = parseInt(document.getElementById('priority').value) || 0;
 
-  const payload = { robot_id: rid, source_id: src_id, dest_id: dest_id, vmax: vmax };
+  // Calculate speed scaling (same as server)
+  const priority_speed_scale = 1.0 + (priority * 0.2);
+  const vmax_scaled = Math.min(vmax * priority_speed_scale, 2.0);  // VMAX_GLOBAL = 2.0
+
+  console.log(`%c[SPAWN] ${rid || 'auto-id'} | Priority: ${priority} | Base vmax: ${vmax} | Scale: ${priority_speed_scale.toFixed(2)}x | Scaled vmax: ${vmax_scaled.toFixed(2)} m/s`, 'background: #22c55e; color: #000; padding: 6px 10px; border-radius: 4px; font-weight: bold;');
+
+  const payload = { 
+    robot_id: rid, 
+    source_id: src_id, 
+    dest_id: dest_id, 
+    vmax: vmax,
+    priority: priority
+  };
   try {
     const r = await fetch(`${SERVER_HTTP}/spawn`, {
       method:'POST',
@@ -731,12 +792,17 @@ document.getElementById('spawnBtn').addEventListener('click', async ()=>{
     });
     const data = await r.json();
     if(!r.ok){
-      console.warn('spawn failed', data);
+      console.error('Spawn failed:', data);
       alert('Spawn failed: ' + (data.error || JSON.stringify(data.errors || {})));
       rememberSelections();
       await fetchEnv();
       return;
     }
+    console.log(`%c[SUCCESS] Robot spawned with scaled speed`, 'background: #0ea5e9; color: #fff; padding: 4px 8px; border-radius: 4px;');
+    // clear form
+    document.getElementById('robotId').value = '';
+    document.getElementById('vmax').value = '0.8';
+    document.getElementById('priority').value = '0';
     rememberSelections();
     await fetchEnv();
   } catch(e){
@@ -746,6 +812,7 @@ document.getElementById('spawnBtn').addEventListener('click', async ()=>{
 });
 
 document.getElementById('clearObstacles').addEventListener('click', async ()=>{
+  if(!confirm('Clear all static obstacles?')) return;
   const obs = [...(world.obstacles || [])];
   for(const o of obs){
     await fetch(`${SERVER_HTTP}/env/obstacle/${encodeURIComponent(o.id)}`, { method:'DELETE' });
@@ -849,9 +916,11 @@ function connectWebSocket(){
         world.robots[r.id] = r;
         draw();
       }
-      else if(msg.msg_type === 'robot_deactivated'){
+      else if(msg.msg_type === 'robot_deactivated' || msg.msg_type === 'robot_removed'){
         const id = msg.robot_id;
-        if(world.robots[id]) world.robots[id].active = false;
+        if(world.robots[id]) {
+          world.robots[id].active = false;
+        }
         draw();
       }
       else if(msg.msg_type === 'spawn_rejected'){

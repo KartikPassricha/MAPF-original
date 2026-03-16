@@ -1,0 +1,6 @@
+numpy
+fastapi
+pydantic
+uvicorn
+requests
+websockets

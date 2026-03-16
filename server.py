@@ -184,7 +184,8 @@ def compute_desired_velocity(current_pos: np.ndarray,
     """
     disp_vec = (goal_pos - current_pos)[:2]
     norm = np.linalg.norm(disp_vec)
-    if norm < robot_radius / 5:
+    # Improved: Reduce stopping threshold to prevent premature halting near goal
+    if norm < 0.01:  # Smaller threshold for smoother arrival
         return np.zeros(2)
     disp_vec = disp_vec / norm
     desired_vel = vmax * disp_vec
@@ -254,9 +255,11 @@ def vo_compute_velocity(robot: np.ndarray,
         dispBA = pA - pB
         distBA = np.linalg.norm(dispBA)
         thetaBA = np.arctan2(dispBA[1], dispBA[0])
-        if 2.2 * ROBOT_RADIUS > distBA:
-            distBA = 2.2 * ROBOT_RADIUS
-        phi_obst = np.arcsin(2.2 * ROBOT_RADIUS / distBA)
+        # Improved: Increase safety factor for more accurate obstacle detection
+        safety_factor = 2.5  # Increased from 2.2 for better avoidance
+        if safety_factor * ROBOT_RADIUS > distBA:
+            distBA = safety_factor * ROBOT_RADIUS
+        phi_obst = np.arcsin(safety_factor * ROBOT_RADIUS / distBA)
         phi_left = thetaBA + phi_obst
         phi_right = thetaBA - phi_obst
 
@@ -269,9 +272,9 @@ def vo_compute_velocity(robot: np.ndarray,
         Amat[i * 2 + 1, :] = Atemp
         bvec[i * 2 + 1] = btemp
 
-    # Sample search-space for velocities
-    th = np.linspace(0, 2 * np.pi, 20)
-    vel = np.linspace(0, VMAX_GLOBAL, 5)
+    # Improved: Increase sampling resolution to reduce jiggling and improve smoothness
+    th = np.linspace(0, 2 * np.pi, 50)  # Increased from 20
+    vel = np.linspace(0, VMAX_GLOBAL, 10)  # Increased from 5
     vv, thth = np.meshgrid(vel, th)
     vx_sample = (vv * np.cos(thth)).flatten()
     vy_sample = (vv * np.sin(thth)).flatten()
@@ -321,8 +324,14 @@ async def compute_controls_once():
     if not robots:
         return
 
-    # We only READ world here and write robot velocities; spawn/dest changes use WORLD_LOCK.
-    robot_ids = list(robots.keys())
+    # Evaluate higher-priority robots first so lower-priority robots
+    # treat them as obstacles (yield-to behavior).
+    robot_ids = sorted(
+        robots.keys(),
+        key=lambda rid: robots[rid].get("priority", 0),
+        reverse=True,
+    )
+
     for rid in robot_ids:
         r = robots.get(rid)
         if not r or not r.get("active", True):
@@ -345,12 +354,16 @@ async def compute_controls_once():
             vmax=vmax,
         )
 
-        # Build obstacles: other active robots + static obstacles as zero-velocity robots
+        my_priority = r.get("priority", 0)
+
+        # Build obstacles: only robots with priority >= mine + static obstacles
         other_states = []
         for oid, o in robots.items():
             if oid == rid:
                 continue
             if not o.get("active", True):
+                continue
+            if o.get("priority", 0) < my_priority:
                 continue
             opx, opy = o["position"]
             ovx, ovy = o.get("velocity", [0.0, 0.0])
@@ -407,6 +420,7 @@ class ObstacleModel(BaseModel):
 async def get_env():
     return serialize_world()
 
+
 @app.post("/env/reset")
 async def reset_environment():
     """
@@ -419,7 +433,6 @@ async def reset_environment():
     await manager.broadcast({"msg_type": "env_changed", "world": serialize_world()})
     print("[REST] environment reset to initial state")
     return {"ok": True}
-
 
 
 @app.post("/env/source")
@@ -455,9 +468,10 @@ async def spawn_robot(payload: dict):
     """
     Spawn robots via REST:
 
-      { "robot_id": "R-1", "source_id": "S-1", "dest_id": "D-2", "vmax": 0.8 }
+      { "robot_id": "R-1", "source_id": "S-1", "dest_id": "D-2", "vmax": 0.8, "priority": 1 }
 
     Rule: destination must not already be used by an ACTIVE robot.
+    Priority scaling: Higher priority → faster speed (vmax * (1 + priority * 0.2))
     """
     async with WORLD_LOCK:
         dest_id = payload.get("dest_id") or payload.get("dest")
@@ -500,20 +514,32 @@ async def spawn_robot(payload: dict):
         if not dest_obj:
             return JSONResponse({"ok": False, "error": "invalid dest_id"}, status_code=400)
 
+        priority = int(payload.get("priority", 0))
+        vmax_base = float(payload.get("vmax", VMAX_GLOBAL))
+
+        # Scale vmax based on priority
+        # Priority 0: vmax × 1.0
+        # Priority 1: vmax × 1.2
+        # Priority 2: vmax × 1.4, etc.
+        priority_speed_scale = 1.0 + (priority * 0.2)
+        vmax_scaled = min(vmax_base * priority_speed_scale, VMAX_GLOBAL)
+
         WORLD["robots"][rid] = {
             "id": rid,
-            "position": clamp_position(pos, WORLD["bounds"]),
-            "velocity": [0.0, 0.0],
+            "source_id": src_id,
             "dest_id": dest_id,
             "dest": [dest_obj["x"], dest_obj["y"]],
+            "vmax": vmax_scaled,
+            "priority": priority,
             "active": True,
+            "position": pos,
+            "velocity": [0.0, 0.0],
             "timestamp": time.time(),
-            "vmax": payload.get("vmax", 0.8),
         }
 
         await manager.broadcast({"msg_type": "spawned_via_rest", "world": serialize_world()})
-        print(f"[REST] spawned {rid} from {src_id} -> {dest_id}")
-        return {"ok": True, "robot_id": rid}
+        print(f"[REST] spawned {rid} from {src_id} -> {dest_id} | priority={priority} | vmax={vmax_scaled:.2f} (base={vmax_base})")
+        return {"ok": True, "robot_id": rid, "priority": priority, "vmax": vmax_scaled}
 
 
 @app.post("/set_dest")
@@ -606,7 +632,8 @@ async def handle_ws_message(client_id: str, msg: Dict[str, Any]):
             "dest": dest_list,
             "active": active,
             "timestamp": time.time(),
-            "vmax": existing.get("vmax", 0.8),
+            "vmax": existing.get("vmax", 0.8),  # ← Preserve existing scaled vmax
+            "priority": existing.get("priority", 0),  # ← Preserve priority
         }
         await manager.broadcast({"msg_type": "robot_update", "robot": WORLD["robots"][rid]})
 
@@ -638,6 +665,14 @@ async def handle_ws_message(client_id: str, msg: Dict[str, Any]):
                     "reason": "invalid dest_id"
                 })
                 return
+            
+            priority = int(msg.get("priority", 0))
+            vmax_base = float(msg.get("vmax", 0.8))
+            
+            # Apply priority-based speed scaling
+            priority_speed_scale = 1.0 + (priority * 0.2)
+            vmax_scaled = min(vmax_base * priority_speed_scale, VMAX_GLOBAL)
+            
             WORLD["robots"][rid] = {
                 "id": rid,
                 "position": pos,
@@ -646,9 +681,11 @@ async def handle_ws_message(client_id: str, msg: Dict[str, Any]):
                 "dest": [dest_obj["x"], dest_obj["y"]],
                 "active": True,
                 "timestamp": time.time(),
-                "vmax": msg.get("vmax", 0.8),
+                "vmax": vmax_scaled,  # ← Use scaled vmax
+                "priority": priority,
             }
             await manager.broadcast({"msg_type": "robot_spawned", "robot": WORLD["robots"][rid]})
+            print(f"[WS] spawned {rid} via WebSocket | priority={priority} | vmax={vmax_scaled:.2f} (base={vmax_base})")
 
     elif t == "deactivate":
         rid = msg.get("robot_id")
